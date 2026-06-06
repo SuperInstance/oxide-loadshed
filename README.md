@@ -1,95 +1,174 @@
 # oxide-loadshed
 
-Load shedding for GPU job queues with ternary admission. Priority-based shedding, coordinated backoff, graceful recovery.
+Load shedding for GPU job queues with ternary admission control and coordinated backoff.
 
-## Why This Matters
+## Why This Exists
 
-# oxide-loadshed
-Load shedding for GPU job queues with ternary admission control.
-Admission decisions: `+1` (admit), `0` (queue), `-1` (shed).
-Configurable thresholds with priority-based graceful degradation,
-coordinated upstream backoff, and gradual recovery.
+When GPU capacity runs out, you have three choices: accept the job and risk OOM/crash (bad), silently drop it (worse), or explicitly tell the submitter why it was rejected (correct). Load shedding is the disciplined version of that third option. Every incoming job gets a ternary admission decision: **Admit** (+1, capacity available), **Queue** (0, approaching limits but not critical), or **Shed** (-1, over capacity, reject).
 
-## The Five-Layer Stack
+The system goes further than simple rejection. It sends **backoff signals** to upstream producers (Normal / SlowDown / Stop), sheds lowest-priority jobs first when forced, and gradually **recovers** admission thresholds as the queue drains. This means the system degrades gracefully under load instead of falling off a cliff.
 
-This crate is part of the **Oxide Stack** — a distributed GPU runtime built on five layers:
+## Architecture
 
 ```
-┌─────────────────┐
-│  cudaclaw        │  Persistent GPU kernels, warp consensus, SmartCRDT
-├─────────────────┤
-│  cuda-oxide      │  Flux → MIR → Pliron → NVVM → PTX compiler
-├─────────────────┤
-│  flux-core       │  Bytecode VM + A2A agent protocol
-├─────────────────┤
-│  pincher         │  "Vector DB as runtime, LLM as compiler"
-├─────────────────┤
-│  open-parallel   │  Async runtime (tokio fork)
-└─────────────────┘
+┌───────────────────────────────────────────────────┐
+│                 LoadShedder                        │
+│  config: LoadShedConfig                           │
+│    capacity: 100 GiB                              │
+│    admit_threshold: 0.70                          │
+│    shed_threshold: 0.90                           │
+│                                                   │
+│  ┌─────────────────────────────────────┐          │
+│  │         JobQueue (priority-sorted)  │          │
+│  │                                     │          │
+│  │  [CRITICAL] job-5  30 GiB   ← front│          │
+│  │  [HIGH]     job-2  20 GiB          │          │
+│  │  [NORMAL]   job-1  15 GiB          │          │
+│  │  [LOW]      job-3  10 GiB   ← back │          │
+│  │                                     │          │
+│  │  used: 75 GiB / 100 GiB            │          │
+│  └─────────────────────────────────────┘          │
+│                                                   │
+│  Admission Control:                               │
+│  ┌───────────────────────────────────┐            │
+│  │ projected ≤ 70 GiB → Admit (+1)  │            │
+│  │ 70 < projected ≤ 90 → Queue (0)  │            │
+│  │ projected > 90      → Shed (-1)  │            │
+│  └───────────────────────────────────┘            │
+│                                                   │
+│  Backoff Signal to upstream:                      │
+│  ratio < 0.70 → Normal (produce freely)           │
+│  0.70 ≤ ratio < 0.90 → SlowDown                  │
+│  ratio ≥ 0.90 → Stop                             │
+│                                                   │
+│  Recovery: drain_streak × recovery_rate →         │
+│    gradually increases admit threshold             │
+└───────────────────────────────────────────────────┘
 ```
 
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
+**Key types:**
 
-## Design
-
-Every value in this crate follows **ternary algebra** (Z₃):
-
-| Value | Meaning | GPU Analog |
-|-------|---------|------------|
-| +1 | Positive / Active / Healthy | Warp vote yes |
-| 0 | Neutral / Pending / Balanced | Warp vote abstain |
-| -1 | Negative / Failed / Overloaded | Warp vote no |
-
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary LLMs at 60% less power
-2. **GPU warp voting** — hardware ballot returns ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity
-
-## Key Types
-
-```rust
-pub enum Admission
-pub struct Priority
-pub struct Job
-pub struct LoadShedConfig
-pub fn new
-pub struct ShedStats
-pub enum BackoffSignal
-pub struct JobQueue
-pub fn new
-pub fn len
-pub fn is_empty
-pub fn used_capacity
-```
+- `Admission` — `Admit(+1)`, `Queue(0)`, `Shed(-1)` — ternary admission decision
+- `Priority` — `LOWEST(0)` to `CRITICAL(255)` — job priority level
+- `Job` — id, priority, size (GPU memory), submission timestamp
+- `LoadShedConfig` — capacity, admit/shed thresholds, recovery rate
+- `JobQueue` — priority-sorted queue with size tracking
+- `LoadShedder` — the admission controller
+- `BackoffSignal` — `Normal`, `SlowDown`, `Stop` — upstream flow control
 
 ## Usage
 
-```toml
-[dependencies]
-oxide-loadshed = "0.1.0"
-```
-
 ```rust
 use oxide_loadshed::*;
-// See src/lib.rs tests for complete working examples
+
+let mut shedder = LoadShedder::new(LoadShedConfig::new(100)); // 100 GiB capacity
+
+// Evaluate incoming jobs
+let job = Job { id: 1, priority: Priority::NORMAL, size: 10, submitted_at: Instant::now() };
+match shedder.evaluate(&job) {
+    Admission::Admit => { shedder.admit(job); }
+    Admission::Queue => { shedder.admit(job); } // queued but accepted
+    Admission::Shed => { /* reject, notify submitter */ }
+}
+
+// Process jobs (highest priority first)
+while let Some(job) = shedder.complete() {
+    // execute job on GPU
+}
+
+// Check upstream backoff signal
+match shedder.backoff_signal() {
+    BackoffSignal::Normal => { /* submit freely */ }
+    BackoffSignal::SlowDown => { /* reduce submission rate */ }
+    BackoffSignal::Stop => { /* stop submitting immediately */ }
+}
+
+// Emergency: coordinated shed of low-priority jobs
+shedder.admit(Job { id: 1, priority: Priority::CRITICAL, size: 30, submitted_at: Instant::now() });
+shedder.admit(Job { id: 2, priority: Priority::NORMAL, size: 30, submitted_at: Instant::now() });
+shedder.admit(Job { id: 3, priority: Priority::LOW, size: 30, submitted_at: Instant::now() });
+let shed = shedder.coordinated_shed(); // sheds LOW first until under admit threshold
+
+// Stats
+let stats = shedder.stats();
+println!("Admitted: {}, Queued: {}, Shed: {}", 
+    stats.total_admitted, stats.total_queued, stats.total_shed);
+println!("Hit rate: {:.1}%", shedder.stats().total_admitted as f64 / 
+    (stats.total_admitted + stats.total_queued + stats.total_shed) as f64 * 100.0);
 ```
 
-## Testing
+## API Reference
 
-```bash
-git clone https://github.com/SuperInstance/oxide-loadshed.git
-cd oxide-loadshed
-cargo test    # 9 tests
+### `Admission`
+
+```rust
+pub enum Admission {
+    Admit = 1,   // Capacity available
+    Queue = 0,   // Approaching limits
+    Shed = -1,   // Over capacity, reject
+}
 ```
 
-## Stats
+### `Priority`
 
-| Metric | Value |
-|--------|-------|
-| Tests | 9 |
-| Lines of Rust | 458 |
-| Public API | 27 items |
+```rust
+pub struct Priority(pub u8);
+// Constants: LOWEST(0), LOW(64), NORMAL(128), HIGH(192), CRITICAL(255)
+```
 
-## License
+### `Job`
 
-Apache-2.0
+```rust
+pub struct Job { pub id: u64, pub priority: Priority, pub size: u64, pub submitted_at: Instant }
+```
+
+### `LoadShedConfig`
+
+- `new(capacity: u64) -> Self` — with default thresholds (0.70 admit, 0.90 shed)
+- `capacity: u64`, `admit_threshold: f64`, `shed_threshold: f64`, `recovery_rate: f64`
+
+### `JobQueue`
+
+- `new() -> Self` / `len() -> usize` / `is_empty() -> bool`
+- `used_capacity() -> u64` — total size of queued jobs
+- `enqueue(job)` — insert in priority order (highest first)
+- `dequeue() -> Option<Job>` — remove highest priority
+- `shed_lowest() -> Option<Job>` — remove lowest priority
+- `shed_to(target: u64) -> Vec<Job>` — shed from bottom until under target
+
+### `LoadShedder`
+
+- `new(config: LoadShedConfig) -> Self`
+- `evaluate(job: &Job) -> Admission` — ternary admission decision
+- `admit(job: Job)` — enqueue accepted job
+- `complete() -> Option<Job>` — dequeue and process highest priority
+- `coordinated_shed() -> Vec<Job>` — emergency shed to admit threshold
+- `backoff_signal() -> BackoffSignal` — upstream flow control signal
+- `recovery_admit_threshold() -> f64` — adjusted threshold during drain
+- `queue() -> &JobQueue` / `queue_mut() -> &mut JobQueue`
+- `stats() -> &ShedStats`
+
+### `BackoffSignal`
+
+```rust
+pub enum BackoffSignal { Normal, SlowDown, Stop }
+```
+
+### `ShedStats`
+
+- `total_admitted: u64`, `total_queued: u64`, `total_shed: u64`
+- `shed_by_priority: HashMap<Priority, u64>` — per-priority shed counts
+- `queue_depth_history: VecDeque<(Instant, usize)>` — last 256 depth snapshots
+
+## The Deeper Idea
+
+This is the **overload protection layer** in the oxide stack's resource architecture. The ternary admission signal (Admit/Queue/Shed) drives real-time decisions, while the backoff signal (Normal/SlowDown/Stop) provides feedback to upstream producers. Together, they implement end-to-end flow control: the shedder doesn't just protect itself, it tells producers how to behave.
+
+The recovery mechanism is the subtle part. After the queue drains below the admit threshold for several consecutive cycles, the admit threshold gradually increases. This prevents the system from oscillating between "shed everything" and "accept everything" — instead, it smoothly transitions back to normal operation. The `recovery_rate` parameter controls how fast this happens: 0.10 means the threshold increases by ~0.5% per drain cycle, so full recovery from a deep shed takes ~20 cycles.
+
+## Related Crates
+
+- **oxide-capacity** — capacity planning that informs shedder thresholds
+- **oxide-health-monitor** — GPU health events that trigger more aggressive shedding
+- **oxide-tenancy** — multi-tenant isolation that determines per-tenant shed rates
+- **oxide-federation** — cross-cluster routing that can offload shed jobs to other clusters
