@@ -1,0 +1,8 @@
+[package]
+name = "oxide-loadshed"
+version = "0.1.0"
+edition = "2021"
+description = "Load shedding for GPU job queues with ternary admission. Priority-based shedding, coordinated backoff, graceful recovery."
+license = "MIT"
+
+[dependencies]
